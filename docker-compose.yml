@@ -1,60 +1,75 @@
 services:
-  # ---------- Service Discovery ----------
   consul:
-    image: hashicorp/consul:1.15
+    image: hashicorp/consul:1.19
     container_name: consul
-    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
+    command: agent -dev -client=0.0.0.0 -ui
     ports:
-      - "8500:8500"   # Consul UI / API
-    healthcheck:
-      test: ["CMD", "consul", "members"]
-      interval: 3s
-      timeout: 2s
-      retries: 15
-    restart: unless-stopped
+      - "8500:8500"
     networks:
-      - marketplace_net
+      - marketplace
 
-  # ---------- API Gateway & Load Balancer ----------
-  traefik:
-    image: traefik:v2.10
-    container_name: traefik
-    command:
-      - "--api.insecure=true"
-      - "--providers.consulcatalog=true"
-      - "--providers.consulcatalog.endpoint.address=http://consul:8500"
-      - "--providers.consulcatalog.exposedByDefault=false"
-      - "--providers.consulcatalog.refreshInterval=3s"
-      - "--providers.consulcatalog.defaultRule=PathPrefix(`/`)"
-      - "--entrypoints.web.address=:80"
-    ports:
-      - "80:80"       # ЕДИНАЯ ТОЧКА ВХОДА
-      - "8080:8080"   # Traefik dashboard
-    depends_on:
-      consul:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - marketplace_net
-
-  # ---------- Auth Service ----------
   auth:
-    build: ./auth_service
-    container_name: auth-1
+    build:
+      context: ./auth_service
+    container_name: auth
     environment:
-      SERVICE_ID: auth-1
-      PORT: 8000
-      CONSUL_URL: http://consul:8500
-      JWT_SECRET: ${JWT_SECRET:-dev_secret_change_me_in_prod}
-      JWT_TTL_HOURS: ${JWT_TTL_HOURS:-1}
+      - SERVICE_NAME=auth
+      - SERVICE_ID=auth-1
+      - PORT=8000
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8500
+      - JWT_SECRET=change-me-in-production
     depends_on:
-      consul:
-        condition: service_healthy
-    restart: unless-stopped
+      - consul
     networks:
-      - marketplace_net
+      - marketplace
 
+  catalog-1:
+    build:
+      context: ./catalog_service
+    container_name: catalog-1
+    environment:
+      - SERVICE_NAME=catalog
+      - SERVICE_ID=catalog-1
+      - INSTANCE_NAME=catalog-1
+      - PORT=8000
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8500
+    depends_on:
+      - consul
+    networks:
+      - marketplace
+
+  catalog-2:
+    build:
+      context: ./catalog_service
+    container_name: catalog-2
+    environment:
+      - SERVICE_NAME=catalog
+      - SERVICE_ID=catalog-2
+      - INSTANCE_NAME=catalog-2
+      - PORT=8000
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8500
+    depends_on:
+      - consul
+    networks:
+      - marketplace
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - auth
+      - catalog-1
+      - catalog-2
+    networks:
+      - marketplace
 
 networks:
-  marketplace_net:
+  marketplace:
     driver: bridge
