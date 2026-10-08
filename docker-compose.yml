@@ -1,0 +1,60 @@
+services:
+  # ---------- Service Discovery ----------
+  consul:
+    image: hashicorp/consul:1.15
+    container_name: consul
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
+    ports:
+      - "8500:8500"   # Consul UI / API
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 3s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+    networks:
+      - marketplace_net
+
+  # ---------- API Gateway & Load Balancer ----------
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    command:
+      - "--api.insecure=true"
+      - "--providers.consulcatalog=true"
+      - "--providers.consulcatalog.endpoint.address=http://consul:8500"
+      - "--providers.consulcatalog.exposedByDefault=false"
+      - "--providers.consulcatalog.refreshInterval=3s"
+      - "--providers.consulcatalog.defaultRule=PathPrefix(`/`)"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"       # ЕДИНАЯ ТОЧКА ВХОДА
+      - "8080:8080"   # Traefik dashboard
+    depends_on:
+      consul:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - marketplace_net
+
+  # ---------- Auth Service ----------
+  auth:
+    build: ./auth_service
+    container_name: auth-1
+    environment:
+      SERVICE_ID: auth-1
+      PORT: 8000
+      CONSUL_URL: http://consul:8500
+      JWT_SECRET: ${JWT_SECRET:-dev_secret_change_me_in_prod}
+      JWT_TTL_HOURS: ${JWT_TTL_HOURS:-1}
+    depends_on:
+      consul:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - marketplace_net
+
+
+networks:
+  marketplace_net:
+    driver: bridge
