@@ -1,123 +1,150 @@
+"""
+Order Service — заказы пользователей (in-memory).
+Студент A.
+"""
+
 import os
+import socket
 import time
-import json
-import uuid
-import urllib.request
-from typing import Dict, Optional
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Dict, List
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
-CONSUL_HOST = os.getenv("CONSUL_HOST", "consul")
-CONSUL_PORT = int(os.getenv("CONSUL_PORT", "8500"))
-SERVICE_NAME = os.getenv("SERVICE_NAME", "catalog")
-SERVICE_ID = os.getenv("SERVICE_ID", "catalog-1")
-INSTANCE_NAME = os.getenv("INSTANCE_NAME", SERVICE_ID)
-SERVICE_PORT = int(os.getenv("PORT", "8000"))
-SERVICE_ADDR = os.getenv("SERVICE_ADDR", SERVICE_ID)
+CONSUL_URL = os.getenv("CONSUL_URL", "http://consul:8500")
+CONSUL_REGISTER = f"{CONSUL_URL}/v1/agent/service/register"
+CONSUL_DEREGISTER = f"{CONSUL_URL}/v1/agent/service/deregister"
 
-products_db: Dict[str, dict] = {}
+SERVICE_ID = os.getenv("SERVICE_ID", "order-1")
+SERVICE_NAME = "order-service"
+PORT = int(os.getenv("PORT", "8000"))
+HOST_IP = os.getenv("HOST_IP") or socket.gethostbyname(socket.gethostname())
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(SERVICE_ID)
+
+# In-memory заказы. items содержат только productId и quantity —
+# детали товаров подтягивает GraphQL Gateway (агрегация).
+orders_db: Dict[int, dict] = {
+    101: {"id": 101, "userId": "123", "createdAt": "2024-01-01T10:00:00Z",
+          "items": [{"productId": 1, "quantity": 2}, {"productId": 3, "quantity": 1}]},
+    102: {"id": 102, "userId": "123", "createdAt": "2024-01-05T14:30:00Z",
+          "items": [{"productId": 1, "quantity": 1}, {"productId": 5, "quantity": 2}]},
+    103: {"id": 103, "userId": "123", "createdAt": "2024-01-10T09:15:00Z",
+          "items": [{"productId": 2, "quantity": 1}]},
+    104: {"id": 104, "userId": "456", "createdAt": "2024-01-03T11:00:00Z",
+          "items": [{"productId": 4, "quantity": 1}, {"productId": 6, "quantity": 1}]},
+    105: {"id": 105, "userId": "789", "createdAt": "2024-01-07T16:45:00Z",
+          "items": [{"productId": 7, "quantity": 1},
+                    {"productId": 8, "quantity": 3},
+                    {"productId": 10, "quantity": 1}]},
+}
 
 
-class ProductCreate(BaseModel):
-    name: str
-    price: float
-    description: Optional[str] = None
+def consul_register_with_retry(payload: dict, retries: int = 15, delay: float = 2.0) -> None:
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.put(CONSUL_REGISTER, json=payload, timeout=3)
+            if r.status_code == 200:
+                log.info("Registered in Consul as %s", SERVICE_ID)
+                return
+        except requests.RequestException as e:
+            log.warning("Consul not ready (%d/%d): %s", attempt, retries, e)
+        time.sleep(delay)
+    raise RuntimeError("Failed to register in Consul after retries")
 
 
-class ProductUpdate(BaseModel):
-    name: Optional[str] = None
-    price: Optional[float] = None
-    description: Optional[str] = None
+def consul_deregister() -> None:
+    try:
+        requests.put(f"{CONSUL_DEREGISTER}/{SERVICE_ID}", timeout=3)
+        log.info("Deregistered from Consul: %s", SERVICE_ID)
+    except requests.RequestException as e:
+        log.warning("Consul deregister failed: %s", e)
 
 
-app = FastAPI(title=f"Catalog Service ({INSTANCE_NAME})", version="1.0.0")
-
-
-def register_in_consul():
-    url = f"http://{CONSUL_HOST}:{CONSUL_PORT}/v1/agent/service/register"
-    payload = {
-        "Name": SERVICE_NAME,
+def build_consul_payload() -> dict:
+    return {
         "ID": SERVICE_ID,
-        "Address": SERVICE_ADDR,
-        "Port": SERVICE_PORT,
+        "Name": SERVICE_NAME,
+        "Address": HOST_IP,
+        "Port": PORT,
         "Check": {
-            "HTTP": f"http://{SERVICE_ADDR}:{SERVICE_PORT}/health",
-            "Interval": "10s",
+            "HTTP": f"http://{HOST_IP}:{PORT}/health",
+            "Interval": "5s",
             "Timeout": "2s",
+            "DeregisterCriticalServiceAfter": "30s",
         },
     }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="PUT",
-                                 headers={"Content-Type": "application/json"})
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    consul_register_with_retry(build_consul_payload())
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            print(f"[consul] Registered {SERVICE_ID}: {resp.status}")
-    except Exception as e:
-        print(f"[consul] Registration failed: {e}")
+        yield
+    finally:
+        consul_deregister()
 
 
-def deregister_from_consul():
-    url = f"http://{CONSUL_HOST}:{CONSUL_PORT}/v1/agent/service/deregister/{SERVICE_ID}"
-    req = urllib.request.Request(url, method="PUT")
-    try:
-        with urllib.request.urlopen(req, timeout=5):
-            print(f"[consul] Deregistered {SERVICE_ID}")
-    except Exception as e:
-        print(f"[consul] Deregistration failed: {e}")
+app = FastAPI(
+    title="Order Service",
+    version="1.0.0",
+    description=(
+        "Заказы пользователей. Возвращает только `productId` и `quantity` — "
+        "детали товара агрегирует GraphQL Gateway через Catalog Service."
+    ),
+    lifespan=lifespan,
+    root_path="/api/orders",
+)
 
 
-@app.on_event("startup")
-def on_startup():
-    time.sleep(3)
-    register_in_consul()
+class OrderItemIn(BaseModel):
+    productId: int = Field(..., description="ID товара из Catalog")
+    quantity: int = Field(..., ge=1, description="Количество")
 
 
-@app.on_event("shutdown")
-def on_shutdown():
-    deregister_from_consul()
+class OrderIn(BaseModel):
+    userId: str = Field(..., min_length=1, description="ID пользователя")
+    items: List[OrderItemIn] = Field(..., description="Позиции заказа")
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "instance_id": INSTANCE_NAME}
+@app.get("/health", tags=["system"])
+def health_check():
+    """Health-check для Consul."""
+    return {"status": "ok", "service": SERVICE_ID}
 
 
-@app.get("/products")
-def list_products():
-    return {
-        "instance_id": INSTANCE_NAME,
-        "count": len(products_db),
-        "products": [{"id": pid, **data} for pid, data in products_db.items()],
+@app.get("/orders", tags=["orders"])
+def list_orders(userId: str = Query(..., description="ID пользователя")):
+    """Все заказы пользователя. Товары — только ID и количество."""
+    user_orders = sorted(
+        (o for o in orders_db.values() if o["userId"] == userId),
+        key=lambda o: o["createdAt"],
+    )
+    return {"userId": userId, "count": len(user_orders), "data": user_orders}
+
+
+@app.get("/orders/{order_id}", tags=["orders"])
+def get_order(order_id: int):
+    """Заказ по ID."""
+    if order_id not in orders_db:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return {"data": orders_db[order_id]}
+
+
+@app.post("/orders", status_code=201, tags=["orders"])
+def create_order(order: OrderIn):
+    """Создать заказ."""
+    new_id = (max(orders_db.keys()) + 1) if orders_db else 1001
+    new_order = {
+        "id": new_id,
+        "userId": order.userId,
+        "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "items": [{"productId": it.productId, "quantity": it.quantity} for it in order.items],
     }
-
-
-@app.post("/products", status_code=201)
-def create_product(product: ProductCreate):
-    pid = str(uuid.uuid4())
-    products_db[pid] = product.model_dump()
-    return {"id": pid, "instance_id": INSTANCE_NAME, **products_db[pid]}
-
-
-@app.get("/products/{product_id}")
-def get_product(product_id: str):
-    if product_id not in products_db:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return {"id": product_id, "instance_id": INSTANCE_NAME, **products_db[product_id]}
-
-
-@app.put("/products/{product_id}")
-def update_product(product_id: str, product: ProductUpdate):
-    if product_id not in products_db:
-        raise HTTPException(status_code=404, detail="Product not found")
-    update_data = {k: v for k, v in product.model_dump().items() if v is not None}
-    products_db[product_id].update(update_data)
-    return {"id": product_id, "instance_id": INSTANCE_NAME, **products_db[product_id]}
-
-
-@app.delete("/products/{product_id}", status_code=204)
-def delete_product(product_id: str):
-    if product_id not in products_db:
-        raise HTTPException(status_code=404, detail="Product not found")
-    del products_db[product_id]
-    return None
+    orders_db[new_id] = new_order
+    return {"data": new_order}
