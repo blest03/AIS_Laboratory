@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package payment;
+
+service PaymentService {
+  rpc CheckPaymentStatus (PaymentRequest) returns (PaymentResponse);
+}
+
+message PaymentRequest {
+  string order_id = 1;
+  double amount = 2;
+  bool   simulate_failure = 3;   // флаг для имитации сбоя
+}
+
+message PaymentResponse {
+  string transaction_id = 1;
+  string status = 2;             // SUCCESS / FAILED / PROCESSING
+  string message = 3;
+}
